@@ -56,28 +56,59 @@ Here is how I solved the major architectural challenges while deploying this pla
 
 ### 💻 The Execution Engine Core
 ```java
-Process process = processBuilder.start();
+            Process process = processBuilder.start();
 
-// 1. INJECT INPUT AND SIMULATE EOF
-if (userInput != null && !userInput.isEmpty()) {
-    try (OutputStream os = process.getOutputStream()) {
-        os.write(userInput.getBytes());
-        os.write("\n".getBytes()); 
-        os.flush();
-    } // Auto-closes the pipe, signaling EOF to the container
-}
+         // Feed input
+         if (userInput != null && !userInput.isEmpty()) {
+             try (OutputStream os = process.getOutputStream()) {
+                 os.write(userInput.getBytes());
+                 os.write("\n".getBytes());
+                 os.flush();
+             }
+         }
 
-// 2. ENFORCE STRICT TIMEOUT (15s Buffer for Compilation)
-boolean finished = process.waitFor(15, TimeUnit.SECONDS);
+         // ✅ Read output CONCURRENTLY to prevent buffer deadlock
+         StringBuilder output = new StringBuilder();
+         StringBuilder error = new StringBuilder();
 
-if (!finished) {
-    // TLE Triggered: Violently kill the container to free server CPU
-    process.destroyForcibly();
-    result.setOutput("");
-    result.setError("Execution Timeout: Code took longer than 15 seconds to execute.");
-    result.setExitCode(-1);
-    return result;
-}
+         Thread stdoutThread = new Thread(() -> {
+             try (BufferedReader reader = new BufferedReader(
+                     new InputStreamReader(process.getInputStream()))) {
+                 String line;
+                 while ((line = reader.readLine()) != null) {
+                     output.append(line).append("\n");
+                 }
+             } catch (IOException ignored) {}
+         });
 
-// 3. CAPTURE OUTPUT (Only executed if within time limits)
-// ... BufferReader logic handles stdOut and stdErr ...
+         Thread stderrThread = new Thread(() -> {
+             try (BufferedReader reader = new BufferedReader(
+                     new InputStreamReader(process.getErrorStream()))) {
+                 String line;
+                 while ((line = reader.readLine()) != null) {
+                     error.append(line).append("\n");
+                 }
+             } catch (IOException ignored) {}
+         });
+
+         stdoutThread.start();
+         stderrThread.start();
+
+         boolean finished = process.waitFor(5, TimeUnit.SECONDS);
+
+         if (!finished) {
+             process.destroyForcibly();
+             stdoutThread.interrupt();
+             stderrThread.interrupt();
+             result.setOutput("");
+             result.setError("Execution Timeout: Code took longer than 5 seconds to execute.");
+             result.setExitCode(-1);
+             return result;
+         }
+
+         stdoutThread.join();
+         stderrThread.join();
+
+         result.setOutput(output.toString().trim());
+         result.setError(error.toString().trim());
+         result.setExitCode(process.exitValue());
